@@ -27,6 +27,9 @@ env/
 *.key
 *.pem
 
+# Contexto local dos agentes
+AGENTS.md
+
 # Ferramentas/relatorios gerados em runtime
 output/
 reports/
