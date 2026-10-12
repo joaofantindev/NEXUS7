@@ -10,12 +10,18 @@ Os templates usam os placeholders {target} e {extra}.
 
 from __future__ import annotations
 
+import re
+import shlex
 import shutil
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 REPOS = BASE / "repos"
+
+# Categorias/padroes que exigem confirmacao explicita de autorizacao.
+SENSITIVE_CATEGORIES = {"EXPLOIT", "MALWARE", "WIRELESS"}
 
 
 def which(name: str) -> str | None:
@@ -41,6 +47,7 @@ CATEGORIES = [
     ("SENSING", "RF sensing (RuView)"),
     ("CRYPTO", "Criptografia"),
     ("SERVICOS", "Servicos (infra)"),
+    ("HISTORICO", "Historico e dados"),
     ("PERSONALIZAR", "Temas e fontes"),
 ]
 
@@ -78,6 +85,9 @@ class Tool:
             return "source"
         return "missing"
 
+    def requires_consent(self) -> bool:
+        return self.category in SENSITIVE_CATEGORIES
+
     def template(self, mode: str) -> str:
         st = self.status()
         if st == "installed":
@@ -94,7 +104,10 @@ class Tool:
         tpl = self.template(mode)
         if not tpl:
             return ""
-        cmd = tpl.replace("{target}", target or "").replace("{extra}", extra or "")
+        # {target} sofre shlex.quote para neutralizar metacharaceteres de
+        # shell (injecao). {extra} e fragmento de shell por design.
+        tv = shlex.quote(target) if target.strip() else ""
+        cmd = tpl.replace("{target}", tv).replace("{extra}", extra or "")
         while "  " in cmd:
             cmd = cmd.replace("  ", " ")
         return cmd.strip()
@@ -192,9 +205,9 @@ TOOLS: list[Tool] = [
         id="sqlmap", name="SQLMap", category="EXPLOIT",
         description="Automacao de injecao de SQL e takeover de banco de dados.",
         target_label="URL com parametro", target_placeholder="http://alvo/item.php?id=1",
-        light="sqlmap -u \"{target}\" --batch --random-agent {extra}",
-        advanced="sqlmap -u \"{target}\" --batch --level 5 --risk 3 --dbs {extra}",
-        repo_light="cd repos/sqlmap && python3 sqlmap.py -u \"{target}\" --batch {extra}",
+        light="sqlmap -u {target} --batch --random-agent {extra}",
+        advanced="sqlmap -u {target} --batch --level 5 --risk 3 --dbs {extra}",
+        repo_light="cd repos/sqlmap && python3 sqlmap.py -u {target} --batch {extra}",
         supports_proxy=True, bin="sqlmap", repo="sqlmap",
         install="sudo pacman -S sqlmap",
     ),
@@ -375,3 +388,44 @@ def find_terminal() -> list[str] | None:
                 return [cand, "start", "--"]
             return [cand, "-e"]
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Parser de saida -> (kind, titulo, detalhe) para resultados/relatorios
+# --------------------------------------------------------------------------- #
+def parse_report(tool_id: str, output: str) -> list[tuple[str, str, str]]:
+    """Extrai achados estruturados do stdout de uma ferramenta."""
+    out = output or ""
+    items: list[tuple[str, str, str]] = []
+    if tool_id == "nmap":
+        for m in re.finditer(r"Nmap scan report for\s+(\S+)", out):
+            items.append(("host", m.group(1), ""))
+        for m in re.finditer(r"^(\d+)/(tcp|udp)\s+open\s+(\S+)",
+                             out, re.MULTILINE):
+            items.append(("porta", f"{m.group(1)}/{m.group(2)}", m.group(3)))
+    elif tool_id == "nuclei":
+        # formato nuclei: [URL] [info|low|medium|high|critical] nome
+        pat = re.compile(r"\[(\S+)\]\s*\[(info|low|medium|high|critical)\]\s+(.+)")
+        for m in pat.finditer(out):
+            items.append(("achado", m.group(3),
+                          f"{m.group(2)} @ {m.group(1)}"))
+    elif tool_id == "nikto":
+        for m in re.finditer(r"^\+\s+(.+)$", out, re.MULTILINE):
+            items.append(("achado", m.group(1).strip(), ""))
+    elif tool_id == "amass":
+        seen = set()
+        for name in re.findall(r"(?:[-\.])\b[a-z0-9][a-z0-9-]*\.[a-z]{2,}", out):
+            name = name.lower()
+            if name not in seen and len(name) > 3:
+                seen.add(name)
+                items.append(("dominio", name, ""))
+    else:
+        lines = [ln.strip() for ln in out.splitlines()
+                 if ln.strip() and not ln.startswith(("[", "*", "--", "Nmap done"))]
+        for ln in lines[:40]:
+            items.append(("linha", ln, ""))
+    return items
+
+
+def looks_like_url(text: str) -> bool:
+    return bool(urllib.parse.urlsplit(text).scheme in ("http", "https"))

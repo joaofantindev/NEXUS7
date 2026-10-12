@@ -13,21 +13,28 @@ clonadas em repos/ (ou instaladas no sistema). Recursos:
 
 import os
 import sys
+import re
+import socket
 import random
 import datetime
 import shlex
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QUrl
+from PySide6.QtCore import (
+    Qt, QTimer, QProcess, QProcessEnvironment, QUrl, QSettings,
+)
 from PySide6.QtGui import QFont, QFontDatabase, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout,
     QGridLayout, QFrame, QStackedWidget, QPlainTextEdit,
-    QComboBox, QCheckBox, QScrollArea,
+    QComboBox, QCheckBox, QScrollArea, QSpinBox,
+    QMessageBox, QFileDialog,
 )
 
 import nexus_tools as NT
 import nexus_services as NS
+import nexus_db as NDB
+import nexus_ai as NAI
 
 THEMES = {
     "RED // Classico": {
@@ -78,10 +85,25 @@ class HackerGUI(QMainWindow):
         self.resize(1240, 800)
         self.theme = dict(THEMES[list(THEMES)[0]])
         self.font_name = "DejaVu Sans Mono"
+        self.settings = QSettings("NEXUS7", "NEXUS7")
         self._proc = None
+        self._on_finish = None
+        self._current_scan_id = None
+        self._last_output = ""
+        self._last_results = []
+        self._ai_task = None
+        self._batch_queue = []
+        self._batch_sensitive = False
         self._active_module = "GERAL"
         self.current_tool = None
+        NDB.init_db()
         self._build_ui()
+        saved_theme = self.settings.value("theme", "")
+        if saved_theme in THEMES:
+            self.theme = dict(THEMES[saved_theme])
+        saved_font = self.settings.value("font", "")
+        if saved_font:
+            self.font_name = saved_font
         self._apply_theme()
         self._boot_sequence()
 
@@ -212,6 +234,7 @@ class HackerGUI(QMainWindow):
         self.stack.addWidget(self._general_page())     # 1
         self.stack.addWidget(self._custom_page())      # 2
         self.stack.addWidget(self._services_page())    # 3
+        self.stack.addWidget(self._history_page())     # 4
         body.addWidget(self.stack, 1)
 
         self.stack.setCurrentIndex(1)
@@ -384,6 +407,19 @@ class HackerGUI(QMainWindow):
         opts.addWidget(self.sudo_check)
         self.term_check = QCheckBox("terminal externo")
         opts.addWidget(self.term_check)
+
+        self.batch_check = QCheckBox("batch")
+        self.batch_check.setToolTip("varios alvos separados por virgula / nova linha")
+        opts.addWidget(self.batch_check)
+
+        opts.addWidget(QLabel("timeout"))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(0, 7200)
+        self.timeout_spin.setValue(int(self.settings.value("timeout", 0)))
+        self.timeout_spin.setSuffix(" s")
+        self.timeout_spin.setMaximumWidth(90)
+        self.timeout_spin.valueChanged.connect(self._update_preview)
+        opts.addWidget(self.timeout_spin)
         opts.addStretch()
         rv.addLayout(opts)
 
@@ -428,6 +464,12 @@ class HackerGUI(QMainWindow):
         clear = QPushButton("LIMPAR")
         clear.clicked.connect(lambda: self.console.clear())
         bar.addWidget(clear)
+        export = QPushButton("EXPORTAR LOG")
+        export.clicked.connect(self._export_log)
+        bar.addWidget(export)
+        report = QPushButton("GERAR RELATORIO")
+        report.clicked.connect(self._save_report)
+        bar.addWidget(report)
         self.status = QLabel("● ONLINE")
         self.status.setObjectName("status")
         bar.addWidget(self.status)
@@ -468,8 +510,135 @@ class HackerGUI(QMainWindow):
             grid.addWidget(b, i // 3, i % 3)
         fv.addLayout(grid)
         v.addWidget(f)
-        v.addStretch()
+
+        ai = self._panel()
+        av = QVBoxLayout(ai)
+        av.setContentsMargins(14, 12, 14, 12)
+        t2 = QLabel("> ASSISTENTE IA (GROQ / OLLAMA)")
+        t2.setObjectName("panel-title")
+        av.addWidget(t2)
+        hint2 = QLabel("usa os resultados do ultimo scan para sugerir o proximo passo ou gerar um script de teste.")
+        hint2.setObjectName("desc")
+        hint2.setWordWrap(True)
+        av.addWidget(hint2)
+
+        akrow = QHBoxLayout()
+        akrow.setSpacing(8)
+        akrow.addWidget(QLabel("chave Groq"))
+        self.ai_key_input = QLineEdit()
+        self.ai_key_input.setEchoMode(QLineEdit.Password)
+        self.ai_key_input.setPlaceholderText("gsk_... (opcional; fica em ~/.config/nexus7/ai.key)")
+        akrow.addWidget(self.ai_key_input, 1)
+        save_key = QPushButton("SALVAR CHAVE")
+        save_key.clicked.connect(self._ai_save_key)
+        akrow.addWidget(save_key)
+        av.addLayout(akrow)
+
+        abrow = QHBoxLayout()
+        abrow.setSpacing(8)
+        sug = QPushButton("SUGERIR PROXIMO PASSO")
+        sug.clicked.connect(self._ai_suggest)
+        gen = QPushButton("GERAR SCRIPT")
+        gen.clicked.connect(self._ai_script)
+        sv = QPushButton("SALVAR SCRIPT")
+        sv.clicked.connect(self._ai_save_script)
+        for b in (sug, gen, sv):
+            abrow.addWidget(b)
+        abrow.addStretch()
+        av.addLayout(abrow)
+
+        self.ai_out = QPlainTextEdit()
+        self.ai_out.setReadOnly(True)
+        self.ai_out.setPlaceholderText("a resposta da IA aparece aqui...")
+        av.addWidget(self.ai_out, 1)
+
+        self.ai_status = QLabel(self._ai_probe_text())
+        self.ai_status.setObjectName("barbase")
+        av.addWidget(self.ai_status)
+        v.addWidget(ai, 1)
         return page
+
+    def _ai_probe_text(self) -> str:
+        have_key = bool(NAI.get_api_key())
+        src = [("Groq" if have_key else "Groq (sem chave)")]
+        if NAI.has_ollama():
+            src.append("Ollama")
+        return "IA disponivel: " + " + ".join(src)
+
+    def _ai_save_key(self):
+        key = self.ai_key_input.text().strip()
+        if not key:
+            self.log("informe a chave Groq antes de salvar.", self.theme["dim"])
+            return
+        NAI.set_api_key(key)
+        self.ai_status.setText(self._ai_probe_text())
+        self.log("chave Groq salva em ~/.config/nexus7/ai.key (fora do git).",
+                 self.theme["good"])
+
+    def _detach_ai(self):
+        if self._ai_task is not None and self._ai_task.isRunning():
+            self._ai_task.terminate()
+            self._ai_task.wait(800)
+        self.ai_out.setPlainText("")
+
+    def _ai_context(self) -> str:
+        parts = []
+        if self._last_results:
+            parts.append("RESULTADOS EXTRAIDOS:\n" + "\n".join(
+                f"- [{r['kind']}] {r['title']}" + (f" :: {r['detail']}" if r["detail"] else "")
+                for r in self._last_results))
+        if self._last_output.strip():
+            body = self._last_output.strip()
+            if len(body) > 6000:
+                body = body[:6000] + "\n[...truncado]"
+            parts.append("SAIDA CRUA (ULTIMOS 6KB):\n" + body)
+        if not parts:
+            self.log("ainda nao ha resultados de scan para a IA usar.",
+                     self.theme["dim"])
+            return ""
+        return "\n\n---\n\n".join(parts)
+
+    def _ai_run(self, fn):
+        ctx = self._ai_context()
+        if not ctx:
+            return
+        self._detach_ai()
+        self.ai_out.setPlainText("pensando...")
+        self._ai_task = NAI.AITask(fn, ctx[:8000], parent=self)
+        self._ai_task.done.connect(self._ai_done)
+        self._ai_task.start()
+
+    def _ai_suggest(self):
+        self._ai_run(NAI.suggest_next)
+
+    def _ai_script(self):
+        self._ai_run(NAI.generate_script)
+
+    def _ai_done(self, tag, payload):
+        if tag == "error":
+            self.ai_out.setPlainText("ERRO: " + payload)
+            self.log("IA falhou: " + payload, self.theme["dim"])
+            return
+        self.ai_out.setPlainText(payload)
+        self._last_ai_ok = tag == "ok"
+        self.log("IA respondeu.", self.theme["good"])
+
+    def _ai_save_script(self):
+        text = self.ai_out.toPlainText()
+        if not text or text.startswith("pensando") or text.startswith("ERRO"):
+            self.log("gere um script primeiro (GERAR SCRIPT).", self.theme["dim"])
+            return
+        out_dir = NT.BASE / "output"
+        out_dir.mkdir(exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Salvar script gerado",
+            str(out_dir / f"{datetime.datetime.now():%Y%m%d_%H%M}_ai.py"),
+            "Python (*.py);;Shell (*.sh);;Texto (*.txt)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.log(f"script salvo em {path}", self.theme["good"])
 
     def _launch_intent(self, tool_id: str, mode: str):
         tool = NT.TOOL_BY_ID[tool_id]
@@ -504,6 +673,7 @@ class HackerGUI(QMainWindow):
         bar.addStretch()
         for text, slot in (("LIGAR TODOS", self._svc_start_all),
                            ("DESLIGAR TODOS", self._svc_stop_all),
+                           ("PING SERVICOS", self._svc_ping),
                            ("ATUALIZAR", self._svc_refresh)):
             b = QPushButton(text)
             b.clicked.connect(slot)
@@ -513,6 +683,17 @@ class HackerGUI(QMainWindow):
                       "sempre disponiveis; OpenVAS/GVM entram apenas se instalados.")
         hint.setObjectName("desc")
         fv.addWidget(hint)
+        mrow = QHBoxLayout()
+        mrow.setSpacing(8)
+        mro = QLabel("MCP:")
+        mro.setObjectName("barbase")
+        mrow.addWidget(mro)
+        for name in ("user-scanner", "ruview"):
+            b = QPushButton(f"INICIAR MCP {name.upper()}")
+            b.clicked.connect(lambda _=False, n=name: self._mcp_launch(n))
+            mrow.addWidget(b)
+        mrow.addStretch()
+        fv.addLayout(mrow)
         v.addWidget(f)
 
         body = QScrollArea()
@@ -581,6 +762,32 @@ class HackerGUI(QMainWindow):
             ref["status"].setText(txt + port)
             ref["status"].setStyleSheet(f"color:{colmap[st]}; font-weight:bold;")
 
+    def _svc_ping(self):
+        self.log("health check dos servicos (TCP connect):", self.theme["main"])
+        checked = False
+        for svc in NS.SERVICES:
+            if not svc.port:
+                continue
+            checked = True
+            try:
+                with socket.create_connection(("127.0.0.1", svc.port), timeout=2):
+                    self.log(f"  {svc.name:-<22} OK  :{svc.port}", self.theme["good"])
+            except OSError:
+                self.log(f"  {svc.name:-<22} FALHOU  :{svc.port}", self.theme["dim"])
+        if not checked:
+            self.log("  nenhum servico com porta definida.", self.theme["text_dim"])
+        else:
+            self.log("health check concluido.", self.theme["text"])
+
+    def _mcp_launch(self, name):
+        cmd = NAI.mcp_launcher(name)
+        if not cmd:
+            self.log(f"MCP {name}: dependencia ausente "
+                     "(user-scanner-mcp ou npx).", self.theme["dim"])
+            return
+        self.log(f"iniciando MCP {name}: {' '.join(cmd)}", self.theme["main"])
+        self._launch_terminal(" ".join(shlex.quote(c) for c in cmd))
+
     def _svc_action(self, svc, action):
         st = svc.status()
         if st == "missing":
@@ -624,6 +831,121 @@ class HackerGUI(QMainWindow):
         self._run_async(prog, [args] if args else None,
                         cmd_note=f"[{svc.name}]",
                         on_finish=lambda: self._svc_next(action))
+
+    # ---------- history page (Fase 2) ----------
+
+    def _history_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+
+        f = self._panel()
+        fv = QVBoxLayout(f)
+        fv.setContentsMargins(12, 10, 12, 10)
+        fv.setSpacing(8)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        t = QLabel("> HISTORICO DE SCANS")
+        t.setObjectName("panel-title")
+        bar.addWidget(t)
+        bar.addStretch()
+        for text, slot in (("ATUALIZAR", self._history_refresh),
+                           ("VER RESULTADOS", self._history_show),
+                           ("REABRIR", self._history_reopen)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+        fv.addLayout(bar)
+
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self.history_list = QListWidget()
+        self.history_list.itemActivated.connect(lambda _i: self._history_show())
+        self.history_list.setToolTip("clique duplo para ver resultados")
+        row.addWidget(self.history_list, 1)
+        self.history_detail = QPlainTextEdit()
+        self.history_detail.setReadOnly(True)
+        row.addWidget(self.history_detail, 1)
+        fv.addLayout(row)
+
+        targets = self._panel()
+        tv = QVBoxLayout(targets)
+        tv.setContentsMargins(0, 8, 0, 0)
+        tv.setSpacing(4)
+        tl = QLabel("> ALVOS RECORRENTES")
+        tl.setObjectName("mod-title")
+        tv.addWidget(tl)
+        self.recent_label = QLabel(NDB.recent_targets(20) and
+                                   "  ".join(NDB.recent_targets(20)) or "(nenhum ainda)")
+        self.recent_label.setObjectName("desc")
+        self.recent_label.setWordWrap(True)
+        tv.addWidget(self.recent_label)
+        fv.addWidget(targets)
+        v.addWidget(f)
+        self._history_refresh()
+        return page
+
+    def _history_refresh(self):
+        if not hasattr(self, "history_list"):
+            return
+        self.history_list.blockSignals(True)
+        self.history_list.clear()
+        for s in NDB.list_scans(60):
+            st = "OK" if s["exit_code"] == 0 else "ERRO" if s["exit_code"] is not None else "RODANDO"
+            label = (f"{s['created_at']}  {s['tool_name']:<18} "
+                     f"{s['target'] or '-':<18} {s['mode']:<4} {st}")
+            it = QListWidgetItem(f"  #{s['id']} {label}")
+            it.setData(Qt.UserRole, s["id"])
+            self.history_list.addItem(it)
+        self.history_list.blockSignals(False)
+
+    def _history_selected(self):
+        item = self.history_list.currentItem()
+        if item is None and self.history_list.count():
+            item = self.history_list.item(0)
+        if item is None:
+            return None
+        return NDB.get_scan(item.data(Qt.UserRole))
+
+    def _history_show(self):
+        scan = self._history_selected()
+        if scan is None:
+            self.log("selecione um scan no historico.", self.theme["dim"])
+            return
+        results = NDB.list_results(scan["id"])
+        head = (f"SCAN #{scan['id']}  {scan['created_at']}\n"
+                f"ferramenta: {scan['tool_name']} ({scan['mode']})   "
+                f"alvo: {scan['target'] or '-'}\n"
+                f"extra: {scan['extra'] or '-'}   proxy: {scan['proxy'] or 'direto'}\n"
+                f"status: {scan['status']}   exit: {scan['exit_code']}\n")
+        body = "\n".join(f"  [{r['kind']}] {r['title']}"
+                         + (f" :: {r['detail']}" if r["detail"] else "")
+                         for r in results) or "  (sem achados extraidos)"
+        logtxt = (scan["log"] or "")[:20000]
+        self.history_detail.setPlainText(
+            f"{head}\n--- RESULTADOS ---\n{body}\n"
+            f"--- LOG (ultimos 20KB) ---\n{logtxt}")
+        self._elevate_current = scan
+        self.log(f"scan #{scan['id']}: {len(results)} achados.", self.theme["good"])
+
+    def _history_reopen(self):
+        scan = self._history_selected()
+        if scan is None:
+            return
+        tool = NT.TOOL_BY_ID.get(scan["tool_id"])
+        if tool is None:
+            self.log("ferramenta do scan nao existe mais no registro.", self.theme["dim"])
+            return
+        self.modules.setCurrentRow(self._row_for_category(tool.category))
+        self._load_tool(tool.id)
+        self.target_input.setText(scan["target"] or "")
+        self.extra_input.setText(scan["extra"] or "")
+        self.mode_combo.setCurrentIndex(0 if scan["mode"] == "light" else 1)
+        pmap = {"tor": 1, "burp": 2}
+        self.proxy_combo.setCurrentIndex(pmap.get(scan["proxy"], 0))
+        self._update_preview()
+        self.log(f"scan #{scan['id']} reaberto no workspace.", self.theme["good"])
 
     # ---------- custom page ----------
 
@@ -728,17 +1050,22 @@ class HackerGUI(QMainWindow):
         if current is None:
             return
         self.theme = dict(THEMES[current.data(Qt.UserRole)])
+        self.settings.setValue("theme", current.data(Qt.UserRole))
         self._apply_theme()
 
     def _on_font(self, current, previous):
         if current is None:
             return
         self.font_name = current.data(Qt.UserRole)
+        self.settings.setValue("font", self.font_name)
         self._apply_theme()
 
     def _restore_defaults(self):
         self.theme = dict(THEMES["RED // Classico"])
         self.font_name = "DejaVu Sans Mono"
+        self.settings.remove("theme")
+        self.settings.remove("font")
+        self.timeout_spin.setValue(0)
         for i in range(self.theme_list.count()):
             if self.theme_list.item(i).data(Qt.UserRole) == "RED // Classico":
                 self.theme_list.setCurrentRow(i)
@@ -762,6 +1089,9 @@ class HackerGUI(QMainWindow):
             self.stack.setCurrentIndex(2)
         elif cid == "SERVICOS":
             self.stack.setCurrentIndex(3)
+        elif cid == "HISTORICO":
+            self.stack.setCurrentIndex(4)
+            self._history_refresh()
         else:
             self.stack.setCurrentIndex(0)
             self.tools_title.setText(f"> FERRAMENTAS // {cid}")
@@ -775,7 +1105,7 @@ class HackerGUI(QMainWindow):
         self.tools_list.blockSignals(True)
         self.tools_list.clear()
         cat = self._active_module
-        if cat in ("GERAL", "PERSONALIZAR", "SERVICOS"):
+        if cat in ("GERAL", "PERSONALIZAR", "SERVICOS", "HISTORICO"):
             cat = "OSINT"
         tools = NT.tools_in(cat)
         tagmap = {"installed": "OK", "source": "SRC", "missing": "FALTA"}
@@ -847,6 +1177,8 @@ class HackerGUI(QMainWindow):
         cmd = t.command(target, extra, self._mode())
         if not cmd:
             return "", {}
+        if self.timeout_spin.value() > 0:
+            cmd = f"timeout {self.timeout_spin.value()}s {cmd}"
         env = {}
         pm = self._proxy_mode()
         if t.supports_proxy and pm != "direct":
@@ -858,6 +1190,8 @@ class HackerGUI(QMainWindow):
         return cmd, env
 
     def _update_preview(self):
+        if not hasattr(self, "cmd_preview"):
+            return
         cmd, env = self._build_command()
         t = self.current_tool
         note = ""
@@ -870,12 +1204,19 @@ class HackerGUI(QMainWindow):
                 parts.append(pm)
             if t.interactive or self.term_check.isChecked():
                 parts.append("interativo")
+            if getattr(self, "timeout_spin", None) and self.timeout_spin.value() > 0:
+                parts.append(f"timeout {self.timeout_spin.value()}s")
             if parts:
                 note = "   // " + " + ".join(parts)
         self.cmd_preview.setPlainText((cmd or "<sem comando>") + note)
-        if self.run_btn is not None:
-            ready = bool(cmd) and (t is None or not t.needs_target or bool(self.target_input.text().strip()))
+        if hasattr(self, "run_btn"):
+            missing = bool(t) and t.status() == "missing"
+            ready = bool(cmd) and not missing and (
+                t is None or not t.needs_target or bool(self.target_input.text().strip()))
             self.run_btn.setEnabled(ready)
+            self.run_btn.setToolTip(
+                "ferramenta ausente: instale primeiro (botao INSTALAR)" if missing
+                else "executar")
 
     # ---------- behavior ----------
 
@@ -957,6 +1298,57 @@ class HackerGUI(QMainWindow):
         QApplication.clipboard().setText(cmd)
         self.log("comando copiado para a area de transferencia.", self.theme["good"])
 
+    def _export_log(self):
+        text = self.console.toPlainText()
+        if not text.strip():
+            self.log("console vazio, nada para exportar.", self.theme["dim"])
+            return
+        out_dir = NT.BASE / "output"
+        out_dir.mkdir(exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar log",
+            str(out_dir / f"console_{datetime.datetime.now():%Y%m%d_%H%M}.log"),
+            "Registros (*.log);;Texto (*.txt)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.log(f"log salvo em {path}", self.theme["good"])
+
+    def _save_report(self):
+        t = self.current_tool
+        if t is None:
+            scan = NDB.get_scan(self._current_scan_id or 0)
+            t = NT.TOOL_BY_ID.get(scan["tool_id"]) if scan else None
+        tid = t.id if t else ""
+        out = self._last_output or self.console.toPlainText()
+        items = NT.parse_report(tid, out)
+        if self._current_scan_id:
+            NDB.add_results(self._current_scan_id, items)
+            NDB.save_log(self._current_scan_id, out[-200000:])
+        out_dir = NT.BASE / "output"
+        out_dir.mkdir(exist_ok=True)
+        base = out_dir / f"report_{datetime.datetime.now():%Y%m%d_%H%M}"
+        with open(base.with_suffix(".log"), "w", encoding="utf-8") as fh:
+            fh.write(self.console.toPlainText())
+        lines = [
+            "NEXUS-7 RELATORIO",
+            f"ferramenta: {t.name if t else tid}",
+            f"data: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"alvo: {self.target_input.text().strip() or '-'}",
+            "",
+            "=== ACHADOS ===",
+        ]
+        if not items:
+            lines.append("(nenhum achado estruturado extraido)")
+        for kind, title, detail in items:
+            lines.append(f"[{kind}] {title}" + (f"  :: {detail}" if detail else ""))
+        rpath = base.with_suffix(".report.txt")
+        with open(rpath, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        self.log(f"relatorio gravado: {rpath} ({len(items)} achados)",
+                 self.theme["good"])
+
     # ---------- execution ----------
 
     def _launch_terminal(self, cmd):
@@ -979,17 +1371,67 @@ class HackerGUI(QMainWindow):
         if t is None:
             self.log("selecione uma ferramenta primeiro.", self.theme["dim"])
             return
-        if t.needs_target and not self.target_input.text().strip():
+        raw = self.target_input.text().strip()
+        batch = self.batch_check.isChecked() or bool(re.split(r"[\n,;]", raw) and "\n" in raw or "," in raw)
+        targets = [p.strip() for p in re.split(r"[\n,;]+", raw) if p.strip()]
+        targets = targets or [raw]
+        if t.needs_target and not targets[0]:
             self.log("informe o alvo antes de executar.", self.theme["dim"])
             return
+        if t.requires_consent() and not self._confirm_consent(t, targets):
+            self.log("execucao cancelada (sem confirmacao de autorizacao).", self.theme["dim"])
+            return
+        NDB.touch_target(targets[0].strip())
+        if t.interactive or self.term_check.isChecked():
+            cmd, _ = self._build_command()
+            if not cmd:
+                self.log("nao ha comando para executar.", self.theme["dim"])
+                return
+            self._launch_terminal(cmd)
+            sid = NDB.add_scan(t.id, t.name, self._mode(), targets[0], "", self._proxy_label())
+            NDB.finish_scan(sid, 0)
+            return
+        self._batch_queue = list(targets)
+        self._run_next_target(t)
+
+    def _proxy_label(self) -> str:
+        return {0: "direto", 1: "tor", 2: "burp"}[self.proxy_combo.currentIndex()]
+
+    def _run_next_target(self, t):
+        if not self._batch_queue:
+            self.log("batch concluido.", self.theme["good"])
+            return
+        target = self._batch_queue.pop(0)
+        self.target_input.setText(target)
         cmd, env = self._build_command()
         if not cmd:
-            self.log("nao ha comando para executar.", self.theme["dim"])
+            self.log(f"'{target}': sem comando para montar.", self.theme["dim"])
             return
-        if t.interactive or self.term_check.isChecked():
-            self._launch_terminal(cmd)
-            return
-        self._spawn("bash", ["-lc", cmd], env)
+        self.log(f">>> alvo [{self._batch_queue and 'batch' or 'unico'}]: {target}",
+                 self.theme["main"])
+        sid = NDB.add_scan(t.id, t.name, self._mode(), target,
+                           self.extra_input.text().strip(), self._proxy_label())
+        self._current_scan_id = sid
+        self._last_output = ""
+        self._last_results = []
+        if self._batch_queue:
+            cb = lambda: self._run_next_target(t)
+        else:
+            cb = None
+        self._spawn("bash", ["-lc", cmd], env, scan_id=sid, on_finish=cb)
+
+    def _confirm_consent(self, t, targets) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("CONFIRMAR AUTORIZACAO")
+        box.setText(f"Executar {t.name} contra: {', '.join(targets)}")
+        box.setInformativeText(
+            "Ferramentas de EXPLOIT/MALWARE/WIRELESS sem autorizacao explicita "
+            "do dono do alvo sao ILEGAIS (Brasil: art. 154-A do Codigo Penal)."
+            "\nVoce confirma que tem permissao/escopo autorizado?")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        return box.exec() == QMessageBox.Yes
 
     def _run_async(self, program, args=None, env=None, cmd_note="", on_finish=None):
         if isinstance(program, list):
@@ -1020,11 +1462,13 @@ class HackerGUI(QMainWindow):
         if on_finish:
             QTimer.singleShot(0, on_finish)
 
-    def _spawn(self, program, args, env):
+    def _spawn(self, program, args, env, scan_id=None, on_finish=None):
         if self._proc is not None and self._proc.state() != QProcess.NotRunning:
             self.log("ja existe um processo em execucao. aguarde ou clique PARAR.", self.theme["dim"])
             return
         self.log("$ " + " ".join(shlex.quote(p) for p in [program, *args]), self.theme["main"])
+        self._scan_id_for = scan_id
+        self._on_finish = on_finish
         self._proc = QProcess(self)
         self._proc.setProcessChannelMode(QProcess.MergedChannels)
         qenv = QProcessEnvironment.systemEnvironment()
@@ -1040,6 +1484,8 @@ class HackerGUI(QMainWindow):
         if self._proc is None:
             return
         data = bytes(self._proc.readAllStandardOutput()).decode(errors="replace")
+        if len(self._last_output) < 1_000_000:
+            self._last_output += data
         for line in data.splitlines():
             self.log(line, self.theme["text"])
 
@@ -1047,6 +1493,23 @@ class HackerGUI(QMainWindow):
         self.status.setText("● ONLINE")
         self.log(f"processo finalizado (exit {code}).",
                  self.theme["good"] if code == 0 else self.theme["dim"])
+        sid = getattr(self, "_scan_id_for", None)
+        if sid:
+            NDB.finish_scan(sid, code)
+            NDB.save_log(sid, self._last_output[-200000:])
+            tid = self.current_tool.id if self.current_tool else ""
+            items = NT.parse_report(tid, self._last_output)
+            NDB.add_results(sid, items)
+            self._last_results = [{"kind": k, "title": t, "detail": d}
+                                  for k, t, d in items[:80]]
+            self.log(f"  scan #{sid}: {len(items)} achados estruturados.",
+                     self.theme["text"])
+        self._scan_id_for = None
+        cb, self._on_finish = self._on_finish, None
+        if cb:
+            QTimer.singleShot(0, cb)
+        if hasattr(self, "history_list"):
+            self._history_refresh()
 
     def _stop_tool(self):
         if self._proc is not None and self._proc.state() != QProcess.NotRunning:
