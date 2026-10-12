@@ -1,0 +1,41 @@
+# Ferramentas clonadas (nao devem ir para o repositorio)
+repos/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Caches / artefatos
+.cache/
+*.log
+*.pid
+*.sock
+
+# Segredos / config local
+.env
+.local/
+*.key
+*.pem
+
+# Ferramentas/relatorios gerados em runtime
+output/
+reports/
+*.cap
+*.pcap
+*.enc
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
